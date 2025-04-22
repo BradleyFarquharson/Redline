@@ -14,50 +14,56 @@ import yaml
 
 from redline.core import io, reconcile, report
 
-CFG = yaml.safe_load((Path(__file__).parent / "config" / "settings.yaml").read_text())
-OUTPUT_DIR = Path("./outputs")
 
-st.set_page_config(page_title="Redline – SIM‑Bundle Reconciliation", layout="wide")
-st.title("📊 Redline – SIM‑Bundle Reconciliation")
+def main():
+    CFG = yaml.safe_load((Path(__file__).parent / "config" / "settings.yaml").read_text())
+    OUTPUT_DIR = Path("./outputs")
 
-uploaded_supplier = st.file_uploader("Supplier / MNO Usage Report", type=("csv", "xlsx"))
-uploaded_raw = st.file_uploader("iONLINE Raw Usage Report", type=("csv", "xlsx"))
-uploaded_billing = st.file_uploader("Customer Billing Report", type=("csv", "xlsx"))
+    st.set_page_config(page_title="Redline – SIM‑Bundle Reconciliation", layout="wide")
+    st.title("📊 Redline – SIM‑Bundle Reconciliation")
 
-run_btn = st.button("Run reconciliation", disabled=not all([uploaded_supplier, uploaded_raw, uploaded_billing]))
+    uploaded_supplier = st.file_uploader("Supplier / MNO Usage Report", type=("csv", "xlsx"))
+    uploaded_raw = st.file_uploader("iONLINE Raw Usage Report", type=("csv", "xlsx"))
+    uploaded_billing = st.file_uploader("Customer Billing Report", type=("csv", "xlsx"))
 
-if run_btn:
-    with st.spinner("Reading files…"):
-        sup_df, sup_meta = io.read_file(uploaded_supplier, "supplier")
-        raw_df, raw_meta = io.read_file(uploaded_raw, "raw")
-        bill_df, bill_meta = io.read_file(uploaded_billing, "billing")
+    run_btn = st.button("Run reconciliation", disabled=not all([uploaded_supplier, uploaded_raw, uploaded_billing]))
 
-    st.success("Files loaded")
+    if run_btn:
+        with st.spinner("Reading files…"):
+            sup_df, sup_meta = io.read_file(uploaded_supplier, "supplier")
+            raw_df, raw_meta = io.read_file(uploaded_raw, "raw")
+            bill_df, bill_meta = io.read_file(uploaded_billing, "billing")
 
-    with st.spinner("Reconciling…"):
-        results = reconcile.run(sup_df, raw_df, bill_df, CFG)
+        st.success("Files loaded")
 
-    st.success("Done")
+        with st.spinner("Reconciling…"):
+            results = reconcile.run(sup_df, raw_df, bill_df, CFG)
 
-    # Display summary tables
-    for key, df in results.items():
-        st.subheader(key.replace("_", " ").title())
-        st.dataframe(df)
+        st.success("Done")
 
-    with st.spinner("Building Excel report…"):
-        audit = {
-            **sup_meta,
-            **raw_meta,
-            **bill_meta,
-            "run_cfg": json.dumps(CFG, separators=(",", ":")),
-        }
-        file_path = report.write(results, audit, OUTPUT_DIR)
+        # Display summary tables
+        for key, df in results.items():
+            st.subheader(key.replace("_", " ").title())
+            st.dataframe(df)
 
-    st.success("Report ready")
-    with open(file_path, "rb") as fh:
-        st.download_button(
-            label="📥 Download Excel",
-            data=fh,
-            file_name=file_path.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ) 
+        with st.spinner("Building Excel report…"):
+            audit = {
+                **sup_meta,
+                **raw_meta,
+                **bill_meta,
+                "run_cfg": json.dumps(CFG, separators=(",", ":")),
+            }
+            file_path = report.write(results, audit, OUTPUT_DIR)
+
+        st.success("Report ready")
+        with open(file_path, "rb") as fh:
+            st.download_button(
+                label="📥 Download Excel",
+                data=fh,
+                file_name=file_path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+
+if __name__ == "__main__":
+    main() 
