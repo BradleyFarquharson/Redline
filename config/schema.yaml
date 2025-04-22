@@ -1,0 +1,23 @@
+supplier:
+  columns:
+    realm: ["Realm"]
+    sim_subscription: ["SIM_Subscription", "Subscription", "SIM"]
+    data_mb: ["Data_Usage_MB", "Data_MB", "Usage_MB"]
+  numeric: ["data_mb"]
+
+raw:
+  columns:
+    customer_code: ["Customer_Code", "Customer"]
+    realm: ["Realm"]
+    sim_subscription: ["SIM_Subscription", "Subscription", "SIM"]
+    data_mb: ["Data_Usage_MB", "Data_MB"]
+  numeric: ["data_mb"]
+
+billing:
+  columns:
+    customer_code: ["Customer_Code", "Customer"]
+    realm: ["Realm"]
+    sim_subscription: ["SIM_Subscription", "Subscription", "SIM"]
+    bundle_mb: ["Bundle_MB", "Bundle"]
+    excess_mb: ["Excess_MB", "Excess"]
+  numeric: ["bundle_mb", "excess_mb"] 
