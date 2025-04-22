@@ -131,16 +131,27 @@ def _excel_report(tables: Dict[str, pd.DataFrame]) -> bytes:
 
 
 # ----------------------------------------------------------------------
-# Streamlit UI
+# Streamlit UI  (Tally‑style)
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="Redline (simple)", layout="wide")
-st.title("📊 Redline — SIM‑Bundle Reconciliation (single file)")
+st.set_page_config(page_title="Redline — SIM‑Bundle Reconciliation", layout="centered")
 
-sup_file = st.file_uploader("Supplier usage (xlsx/csv)")
-raw_file = st.file_uploader("iONLINE raw usage (xlsx/csv)")
-bill_file = st.file_uploader("Customer billing (xlsx/csv)")
+st.title("Redline — SIM‑Bundle Reconciliation")
+st.caption(
+    "Upload the three reports below, check variances instantly, and export a 4‑sheet Excel summary."
+)
 
-if st.button("Run reconciliation", disabled=not all([sup_file, raw_file, bill_file])):
+# --- Upload widgets ---------------------------------------------------
+col_sup, col_raw = st.columns(2)
+with col_sup:
+    sup_file = st.file_uploader("Supplier usage  (.xlsx / .csv)", key="sup")
+with col_raw:
+    raw_file = st.file_uploader("iONLINE raw usage  (.xlsx / .csv)", key="raw")
+
+bill_file = st.file_uploader("Customer billing  (.xlsx / .csv)", key="bill")
+
+run = st.button("Run reconciliation", disabled=not all([sup_file, raw_file, bill_file]))
+
+if run:
     try:
         sup = _load_df(sup_file, "supplier")
         raw = _load_df(raw_file, "raw")
