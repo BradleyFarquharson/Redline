@@ -1,5 +1,0 @@
-tolerances:
-  realm_warn_mb: 5
-  realm_fail_mb: 20
-  customer_warn_mb: 10
-  customer_fail_mb: 50 
