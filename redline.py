@@ -135,9 +135,9 @@ def _excel_report(tables: Dict[str, pd.DataFrame]) -> bytes:
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Redline — SIM‑Bundle Reconciliation", layout="centered")
 
-st.title("Redline — SIM‑Bundle Reconciliation")
+st.title("Redline — Multi Usage Reconciliation")
 st.caption(
-    "Upload the three reports below, check variances instantly, and export a 4‑sheet Excel summary."
+    "Validate that MNO usage, iONLINE raw data, and customer billing all align."
 )
 
 # --- Upload widgets ---------------------------------------------------
