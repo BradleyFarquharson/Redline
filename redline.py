@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Redline — SIM‑Bundle Reconciliation (single‑file edition)
+Redline — SIM‑Bundle Reconciliation
 --------------------------------------------------------
 * Upload three files (Supplier, iONLINE Raw, Customer Billing)
 * Compares usage in absolute MB
@@ -133,7 +133,7 @@ def _excel_report(tables: Dict[str, pd.DataFrame]) -> bytes:
 # ----------------------------------------------------------------------
 # Streamlit UI  (Tally‑style)
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="Redline — SIM‑Bundle Reconciliation", layout="centered")
+st.set_page_config(page_title="Redline", layout="centered")
 
 st.title("Redline — Multi Usage Reconciliation")
 st.caption(
@@ -149,7 +149,7 @@ with col_raw:
 
 bill_file = st.file_uploader("Customer billing  (.xlsx / .csv)", key="bill")
 
-run = st.button("Run reconciliation", disabled=not all([sup_file, raw_file, bill_file]))
+run = st.button("Run", disabled=not all([sup_file, raw_file, bill_file]))
 
 if run:
     try:
