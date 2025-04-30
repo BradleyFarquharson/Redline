@@ -1,7 +1,20 @@
-pandas>=2.2
-pyarrow>=15
-openpyxl>=3.1
-xlsxwriter>=3.2
-streamlit>=1.33
-PyYAML>=6.0
-pytest>=8.2 
+# Core data stack
+pandas==2.2.2           # pyarrow engine optional, fast group-bys
+numpy>=1.26,<1.28       # pinned under 1.28 for current pandas wheels
+
+# Excel writer
+XlsxWriter==3.2.0       # conditional-formatting support
+
+# File readers
+openpyxl==3.1.2         # Excel ingest for billing/raw files
+pyarrow>=15.0.2         # optional back-end; pandas will import it if present
+
+# Web UI
+streamlit==1.35.0
+
+# Type hints (nice to have)
+typing_extensions>=4.11
+
+# Optional: speed up large CSV/Excel parsing (choose one)
+#  duckdb-engine==0.10.0
+#  polars==0.20.28
