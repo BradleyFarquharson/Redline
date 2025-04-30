@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Redline — SIM-Bundle Reconciliation  v2.4.1
--------------------------------------------------
-Cross-checks Supplier summaries, iONLINE raw logs and Customer Billing.
+Redline — SIM-Bundle Reconciliation  v2.4.2
+------------------------------------------
+Compares Supplier summaries, iONLINE raw logs and Customer Billing.
 Outputs three delta tables and a formatted Excel workbook.
 """
 from __future__ import annotations
@@ -10,21 +10,24 @@ import datetime as dt, io, re
 from dataclasses import dataclass, field
 from typing import Final, List
 
-import numpy as np, pandas as pd, streamlit as st, xlsxwriter
+import numpy as np
+import pandas as pd
+import streamlit as st
+import xlsxwriter
 
-# ────────────────────────── Threshold model
+# ───────────────── Threshold model
 @dataclass(frozen=True, slots=True)
 class Threshold:
     warn: int
     fail: int
 
-# ────────────────────────── Configuration
+# ───────────────── Configuration
 @dataclass(frozen=True, slots=True)
 class Config:
     REALM:    Threshold = Threshold(5, 20)
     CUSTOMER: Threshold = Threshold(10, 50)
 
-    BILLING_HEADER_ROW: Final[int] = 4               # 0-indexed
+    BILLING_HEADER_ROW: Final[int] = 4
     REGEX_REALM: Final[re.Pattern] = re.compile(r'(?:\s-\s|:\s)([A-Za-z]{2}\s?\d+)$', re.I)
     REGEX_TOTAL: Final[re.Pattern] = re.compile(r'grand\s+total', re.I)
 
@@ -55,19 +58,17 @@ class Config:
     AUTO_WIDTH: Final[bool] = True
 
 
-CFG = Config()  # singleton
+CFG = Config()               # singleton
 
-# ────────────────────────── Helper utils
-def _seek_start(buf):         # ensure pointer at 0
+# ───────────────── Helper utils
+def _seek_start(buf):                                        # rewind pointer
     try: buf.seek(0)
     except Exception: pass
 
 
 def _std_cols(df: pd.DataFrame, mapping: dict[str, list[str]]) -> pd.DataFrame:
-    df = df.copy()
-    drops: list[str] = []
+    df = df.copy(); drops = []
     norm = lambda s: s.strip().lower().replace(" ", "_")
-
     for canon, aliases in mapping.items():
         hits = [c for c in df.columns if norm(c) in {norm(canon), *map(norm, aliases)}]
         if not hits:
@@ -80,22 +81,15 @@ def _std_cols(df: pd.DataFrame, mapping: dict[str, list[str]]) -> pd.DataFrame:
                 df = df.rename(columns={keep: canon})
         drops.extend(h for h in hits[1:] if h != canon)
     df = df.drop(columns=list(set(drops)))
-    df = df.loc[:, ~df.columns.duplicated()]          # final guard-rail
+    df = df.loc[:, ~df.columns.duplicated()]                 # final guard-rail
     return df
 
 
-def _coerce_numeric(s):  # → float
-    return (
-        s.fillna("")
-         .astype(str)
-         .str.replace(",", "", regex=False)
-         .replace({"-": "0", "": "0"})
-         .astype(float)
-         .fillna(0.0)
-    )
+def _to_float(s: pd.Series) -> pd.Series:                    # safe numeric cast
+    return pd.to_numeric(s.astype(str), errors='coerce').fillna(0.0)
 
 
-def _categorise(df, cols: List[str]):
+def _categorise(df: pd.DataFrame, cols: List[str]):
     for c in cols:
         if c in df.columns:
             df[c] = df[c].astype("category")
@@ -110,18 +104,16 @@ def _read_any(buf, **kw) -> pd.DataFrame:
         return pd.read_csv(buf, encoding_errors="replace", **kw)
     raise ValueError(f"Unsupported file type: {name or '<buffer>'}")
 
-# ────────────────────────── Loaders (cached)
+# ───────────────── Loaders (cached)
 @st.cache_data(show_spinner="Reading supplier file…")
 def load_supplier(buf):
     df = _read_any(buf)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     df = _std_cols(df, CFG.SCHEMA["supplier"])
-
     df = df[~df["realm"].astype(str).str.match(CFG.REGEX_TOTAL, na=False)]
     df["carrier"] = df["carrier"].astype(str).str.upper()
     df["realm"]   = df["realm"].astype(str).str.lower()
-    df["data_mb"] = _coerce_numeric(df["data_mb"])
-
+    df["data_mb"] = _to_float(df["data_mb"])
     _categorise(df, ["carrier", "realm"])
     return df[["carrier", "realm", "data_mb"]]
 
@@ -131,12 +123,10 @@ def load_raw(buf):
     df = _read_any(buf)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     df = _std_cols(df, CFG.SCHEMA["raw"])
-
-    df["data_mb"]  = _coerce_numeric(df["data_mb"])
+    df["data_mb"]  = _to_float(df["data_mb"])
     df["realm"]    = df["realm"].astype(str).str.lower()
     df["carrier"]  = df["carrier"].astype(str).str.upper().fillna("UNKNOWN")
     df["customer"] = df["customer"].astype(str).fillna("<nan>")
-
     _categorise(df, ["customer", "realm", "carrier"])
     return df[["customer", "realm", "carrier", "data_mb"]]
 
@@ -146,8 +136,7 @@ def load_billing(buf):
     df = _read_any(buf, header=CFG.BILLING_HEADER_ROW)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     df = _std_cols(df, CFG.SCHEMA["billing"])
-
-    df["qty"]      = _coerce_numeric(df["qty"])
+    df["qty"]      = _to_float(df["qty"])
     df["customer"] = df["customer"].astype(str).fillna("<nan>")
 
     prod = df["product"].astype(str)
@@ -156,29 +145,27 @@ def load_billing(buf):
     df["bundle_mb"] = df["excess_mb"] = 0.0
     is_bundle = prod.str.contains("bundle", case=False, na=False)
     is_excess = prod.str.contains("excess", case=False, na=False)
-    df.loc[is_bundle, "bundle_mb"] = df.loc[is_bundle, "qty"]
-    df.loc[is_excess & ~is_bundle, "excess_mb"] = df.loc[is_excess & ~is_bundle, "qty"]
+    df.loc[is_bundle, "bundle_mb"]                = df.loc[is_bundle, "qty"]
+    df.loc[is_excess & ~is_bundle, "excess_mb"]   = df.loc[is_excess & ~is_bundle, "qty"]
 
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
     _categorise(df, ["customer", "realm"])
     return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
 
-# ────────────────────────── Aggregation & comparison
+# ───────────────── Aggregation / comparison
 def _agg(df, by: List[str], src: str, tgt: str):
-    return (df.groupby(by, as_index=False, observed=True)[src].sum()
-              .rename(columns={src: tgt}))
+    return df.groupby(by, as_index=False, observed=True)[src].sum().rename(columns={src: tgt})
 
 def _status_series(delta: pd.Series, th: Threshold):
-    bins = [0, th.warn, th.fail, np.inf]
+    bins   = [0, th.warn, th.fail, np.inf]
     labels = ["OK", "WARN", "FAIL"]
     return pd.cut(delta.abs(), bins=bins, labels=labels,
                   right=False, include_lowest=True).astype("category")
 
 def compare(left, right, on: List[str], lcol: str, rcol: str, th: Threshold):
-    cmp = left.merge(right, on=on, how="outer").fillna(0.0)
-    cmp[lcol] = _coerce_numeric(cmp[lcol])
-    cmp[rcol] = _coerce_numeric(cmp[rcol])
-
+    cmp = left.merge(right, on=on, how="outer")
+    cmp[lcol] = _to_float(cmp[lcol])
+    cmp[rcol] = _to_float(cmp[rcol])
     cmp["delta_mb"]  = cmp[lcol] - cmp[rcol]
     cmp["pct_delta"] = np.where(cmp[rcol] == 0, np.nan,
                                 cmp["delta_mb"] / cmp[rcol] * 100)
@@ -186,15 +173,15 @@ def compare(left, right, on: List[str], lcol: str, rcol: str, th: Threshold):
     _categorise(cmp, ["status"])
     return cmp[on + [lcol, rcol, "delta_mb", "pct_delta", "status"]]
 
-# ────────────────────────── Excel
+# ───────────────── Excel builder
 def create_excel(tabs: dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
         wb = xl.book
         colours = {"OK": "#C6EFCE", "WARN": "#FFEB9C", "FAIL": "#FFC7CE"}
         txt     = {"OK": "#006100", "WARN": "#9C6500", "FAIL": "#9C0006"}
-        fmt = {k: wb.add_format({"bg_color": v, "font_color": txt[k], "bold": True})
-               for k, v in colours.items()}
+        fmt     = {k: wb.add_format({"bg_color": v, "font_color": txt[k], "bold": True})
+                   for k, v in colours.items()}
         numfmt = wb.add_format({"num_format": "#,##0.00"})
 
         for name, df in tabs.items():
@@ -216,7 +203,7 @@ def create_excel(tabs: dict[str, pd.DataFrame]) -> bytes:
                     ws.set_column(i, i, width)
     buf.seek(0); return buf.read()
 
-# ────────────────────────── UI
+# ───────────────── UI
 st.set_page_config(page_title="Redline Reconciliation", layout="centered")
 st.markdown(
     """
@@ -244,12 +231,12 @@ if st.button("Run Reconciliation", disabled=not all((f_sup,f_raw,f_bill)), type=
         raw  = load_raw(f_raw)
         bill = load_billing(f_bill)
 
-        sup_realm      = _agg(sup, ["carrier","realm"], "data_mb", "supplier_mb")
-        sup_realm_tot  = _agg(sup, ["realm"],            "data_mb", "supplier_mb")
-        raw_realm      = _agg(raw, ["carrier","realm"],  "data_mb", "raw_mb")
-        raw_cust       = _agg(raw, ["customer","realm"], "data_mb", "raw_mb")
-        bill_realm     = _agg(bill, ["realm"],           "billed_mb", "customer_billed_mb")
-        bill_cust      = _agg(bill, ["customer","realm"],"billed_mb", "customer_billed_mb")
+        sup_realm     = _agg(sup, ["carrier","realm"], "data_mb", "supplier_mb")
+        sup_realm_tot = _agg(sup, ["realm"],            "data_mb", "supplier_mb")
+        raw_realm     = _agg(raw, ["carrier","realm"],  "data_mb", "raw_mb")
+        raw_cust      = _agg(raw, ["customer","realm"], "data_mb", "raw_mb")
+        bill_realm    = _agg(bill, ["realm"],           "billed_mb", "customer_billed_mb")
+        bill_cust     = _agg(bill, ["customer","realm"],"billed_mb", "customer_billed_mb")
 
         sup_vs_raw  = compare(sup_realm,     raw_realm,
                               ["carrier","realm"],
