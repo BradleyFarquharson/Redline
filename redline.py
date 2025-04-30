@@ -338,9 +338,3 @@ if run:
         file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-# little footer (time only, as requested)
-st.markdown(
-    f"<small>Generated {dt.datetime.now():%A %B %d, %Y %H:%M %p}</small>",
-    unsafe_allow_html=True,
-)
