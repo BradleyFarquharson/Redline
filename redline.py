@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Redline — SIM-Bundle Reconciliation
---------------------------------------------------------
+------------------------------------------------------------------
 * Upload three files  (Supplier, iONLINE Raw, Customer Billing)
-* Uses **every row** in each file (no date slicing yet)
+* Uses every row (no date slicing yet)
 * Reconciles usage across carriers, realms, and customers
-* Outputs on-screen dataframes + a 5-sheet Excel report
+* Shows on-screen deltas + lets you download a 5-sheet Excel report
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import datetime as dt
 import io
 import re
-from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -21,15 +20,14 @@ import pandas as pd
 import streamlit as st
 import xlsxwriter
 
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 # Config  – edit tolerances / column aliases here
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 TOLERANCE_REALM_WARN_MB = 5
 TOLERANCE_REALM_FAIL_MB = 20
 TOLERANCE_CUST_WARN_MB = 10
 TOLERANCE_CUST_FAIL_MB = 50
 
-# alias map → canonical names
 SCHEMA: Dict[str, Dict[str, List[str]]] = {
     "supplier": {
         "carrier": ["carrier"],
@@ -38,7 +36,7 @@ SCHEMA: Dict[str, Dict[str, List[str]]] = {
         "data_mb": ["total_mb", "data_mb", "usage_mb"],
     },
     "raw": {
-        "date": ["date"],
+        "date": ["date"],  # retained for future filters
         "msisdn": ["msisdn"],
         "sim": ["sim_serial", "sim"],
         "customer": ["customer_code", "customer"],
@@ -51,37 +49,48 @@ SCHEMA: Dict[str, Dict[str, List[str]]] = {
         "customer": ["customer_co", "customer_code", "customer"],
         "product": ["product/service", "product_service", "product"],
         "qty": ["qty", "quantity"],
-        # realm / bundle_mb / excess_mb are derived later
+        # realm / bundle_mb / excess_mb derived later
     },
 }
 
-REALM_REGEX = re.compile(r"([A-Za-z]{2}\s?\d+)$", re.I)  # last token like 'ZA 3', 'US1'
-TOTAL_ROW_REGEX = re.compile(r"grand\s+total", re.I)
+REALM_REGEX = re.compile(r"([A-Za-z]{2}\s?\d+)$", re.I)          # last token “ZA 3”, “US1”
+TOTAL_ROW_REGEX = re.compile(r"grand\s+total", re.I)             # supplier summary rows
 
-# ──────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────
+# Helper utilities
+# ───────────────────────────────────────────────────────────────
 def _auto_header_row(path_or_buf) -> int:
-    """Return row index that contains the word 'Customer' in A1 column."""
-    df = pd.read_excel(path_or_buf, header=None, nrows=10, engine="openpyxl")
-    idx = df[df.iloc[:, 0].astype(str).str.contains("Customer", case=False, na=False)].index
+    """Return the row idx where column A first contains 'Customer'."""
+    hdr_scan = pd.read_excel(path_or_buf, header=None, nrows=12, engine="openpyxl")
+    idx = hdr_scan[hdr_scan.iloc[:, 0].astype(str).str.contains("Customer", case=False, na=False)].index
     if not len(idx):
         raise ValueError("Could not auto-detect header row in billing file.")
     return int(idx[0])
 
 
 def _std_cols(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
-    """Rename first matching raw column to canonical name, error on missing."""
-    rename = {}
-    for canon, candidates in mapping.items():
-        for c in candidates:
-            if c in df.columns:
-                rename[c] = canon
-                break
-        else:
-            if canon not in df.columns:  # allow derived cols
-                raise ValueError(f"Missing required column '{canon}' (aliases={candidates})")
-    return df.rename(columns=rename)
+    """
+    Rename first matching alias to canonical name **and drop all other aliases**.
+    Guarantees no duplicate canonical columns.
+    """
+    rename, drop = {}, []
+    for canon, aliases in mapping.items():
+        chosen = None
+        for col in aliases:
+            if col in df.columns:
+                if chosen is None:
+                    rename[col] = canon
+                    chosen = col
+                else:
+                    drop.append(col)  # duplicate alias → drop
+        # existing canon column (no alias rename) counts as chosen
+        if canon in df.columns and canon not in rename.values():
+            chosen = canon
+        if chosen is None:
+            raise ValueError(f"Missing required column '{canon}' (aliases={aliases})")
+    df = df.rename(columns=rename).drop(columns=drop)
+    return df
 
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
@@ -101,11 +110,11 @@ def load_billing(upload) -> pd.DataFrame:
     hdr = _auto_header_row(upload)
     df = pd.read_excel(upload, header=hdr, engine="openpyxl")
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
     df = _std_cols(df, SCHEMA["billing"])
+
     df["qty"] = _coerce_numeric(df["qty"])
 
-    # Realm extraction
+    # realm
     df["realm"] = (
         df["product"]
         .astype(str)
@@ -117,7 +126,6 @@ def load_billing(upload) -> pd.DataFrame:
     df["excess_mb"] = np.where(df["product"].str.contains("excess", case=False, na=False), df["qty"], 0.0)
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
 
-    # drop rows with no realm (logged later via comparison deltas)
     return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
 
 
@@ -130,27 +138,23 @@ def load_raw(upload) -> pd.DataFrame:
     df["data_mb"] = _coerce_numeric(df["data_mb"])
     df["realm"] = df["realm"].str.lower()
     df["carrier"] = df["carrier"].str.upper().fillna("UNKNOWN")
-
-    # include every row (no date slice, no status filter per user)
     return df
 
 
 # ─────────────  Supplier Usage  ─────────────
 def load_supplier(upload) -> pd.DataFrame:
-    if upload.name.lower().endswith(("xls", "xlsx")):
-        df = pd.read_excel(upload, engine="openpyxl")
-    else:
-        df = pd.read_csv(upload)
-
+    df = (
+        pd.read_excel(upload, engine="openpyxl")
+        if upload.name.lower().endswith(("xls", "xlsx"))
+        else pd.read_csv(upload)
+    )
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     df = _std_cols(df, SCHEMA["supplier"])
 
-    # clean
-    df = df[~df["realm"].astype(str).str.match(TOTAL_ROW_REGEX)]  # drop Grand Total
+    df = df[~df["realm"].astype(str).str.match(TOTAL_ROW_REGEX)]   # drop summary
     df["carrier"] = df["carrier"].str.upper()
     df["realm"] = df["realm"].str.lower()
     df["data_mb"] = _coerce_numeric(df["data_mb"])
-
     return df[["carrier", "realm", "data_mb"]]
 
 
@@ -188,16 +192,13 @@ def excel_report(tables: Dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
         wb = xl.book
-        styles = {
-            "OK": wb.add_format({"bg_color": "#C6EFCE"}),
-            "WARN": wb.add_format({"bg_color": "#FFEB9C"}),
-            "FAIL": wb.add_format({"bg_color": "#FFC7CE"}),
-        }
+        col_fmt = {"OK": "#C6EFCE", "WARN": "#FFEB9C", "FAIL": "#FFC7CE"}
+        styles = {k: wb.add_format({"bg_color": v}) for k, v in col_fmt.items()}
+
         for sheet, df in tables.items():
             df.to_excel(xl, sheet_name=sheet[:31], index=False)
             ws = xl.sheets[sheet[:31]]
             status_col = df.columns.get_loc("status")
-            # apply conditional colours
             for key, fmt in styles.items():
                 ws.conditional_format(
                     1,
@@ -210,20 +211,30 @@ def excel_report(tables: Dict[str, pd.DataFrame]) -> bytes:
     return buf.read()
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 # Streamlit UI
-# ──────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Redline", layout="centered")
+
+# simple CSS tweak for breathing-room
+st.markdown(
+    """
+    <style>
+    div.stFileUploader > label {margin-bottom: 0.4rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Redline — Multi-Source Usage Reconciliation")
 st.caption("Cross-check MNO usage, iONLINE raw data, and customer billing.")
 
-# --- Upload widgets ------------------------------------------------------
 col1, col2 = st.columns(2)
 with col1:
-    sup_file = st.file_uploader("Supplier usage  (.xlsx / .csv)", key="sup")
+    sup_file = st.file_uploader("Supplier usage (.xlsx / .csv)", key="sup")
 with col2:
-    raw_file = st.file_uploader("iONLINE raw usage  (.xlsx)", key="raw")
-bill_file = st.file_uploader("Customer billing  (.xlsx)", key="bill")
+    raw_file = st.file_uploader("iONLINE raw usage (.xlsx)", key="raw")
+bill_file = st.file_uploader("Customer billing (.xlsx)", key="bill")
 
 run = st.button("Run", disabled=not all([sup_file, raw_file, bill_file]))
 
@@ -236,14 +247,14 @@ if run:
         st.error(f"File error: {e}")
         st.stop()
 
-    # ─── Aggregations ───────────────────────────────────────────────────
+    # ═══ Aggregations ════════════════════════════════════════════
     sup_realm = _agg(sup, ["carrier", "realm"], "data_mb", "supplier_mb")
     raw_realm = _agg(raw, ["carrier", "realm"], "data_mb", "raw_mb")
     raw_cust = _agg(raw, ["customer", "realm"], "data_mb", "raw_mb")
     bill_realm = _agg(bill, ["realm"], "billed_mb", "customer_billed_mb")
     bill_cust = _agg(bill, ["customer", "realm"], "billed_mb", "customer_billed_mb")
 
-    # ─── Comparisons ────────────────────────────────────────────────────
+    # ═══ Comparisons ════════════════════════════════════════════
     sup_vs_raw = compare(
         sup_realm,
         raw_realm,
@@ -256,7 +267,7 @@ if run:
     sup_vs_cust = compare(
         sup_realm,
         bill_realm,
-        ["realm"],  # carrier absent in billing, keep carrier column for context
+        ["realm"],
         "supplier_mb",
         "customer_billed_mb",
         TOLERANCE_REALM_WARN_MB,
@@ -272,7 +283,7 @@ if run:
         TOLERANCE_CUST_FAIL_MB,
     )
 
-    # ─── UI Output ─────────────────────────────────────────────────────
+    # ═══ UI Output ══════════════════════════════════════════════
     st.subheader("Supplier vs Raw  (carrier + realm)")
     st.dataframe(sup_vs_raw)
     st.subheader("Supplier vs Customer Billing  (realm)")
@@ -294,4 +305,3 @@ if run:
         file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
