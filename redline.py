@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Redline — SIM-Bundle Reconciliation
-Upload Supplier, Raw-usage and Customer-billing files, click •Run•,
+Upload Supplier, Raw-usage & Customer-billing files, click •Run•,
 and download a single Excel workbook with three comparison tabs.
 """
 
@@ -18,7 +18,7 @@ import xlsxwriter
 
 # ───────────────────────────── CONFIG
 @dataclass(frozen=True)
-class _Th:            # threshold holder
+class _Th:
     warn: int
     fail: int
 
@@ -27,7 +27,7 @@ class _Th:            # threshold holder
 class _Cfg:
     REALM:    _Th = _Th(5, 20)
     CUSTOMER: _Th = _Th(10, 50)
-    BILL_HDR: int = 4
+    BILL_HDR: int = 4          # fallback row index if auto-detection fails
     REALM_RX: re.Pattern = re.compile(r"(?<=\s-\s)([A-Za-z]{2}\s?\d+)", re.I)
 
     SCHEMA: dict[str, dict[str, List[str]]] = field(
@@ -46,7 +46,7 @@ class _Cfg:
                              "data_mb", "total_mb"],
             },
             "billing": {
-                "customer": ["customer_co", "customer_code", "customer"],
+                "customer": ["customer_code", "customer"],
                 "product":  ["product/service", "product_service", "product"],
                 "qty":      ["qty", "quantity"],
             },
@@ -58,7 +58,6 @@ CFG = _Cfg()
 
 # ───────────────────────────── HELPERS
 def _n(col: str) -> str:
-    """normalise column names → snake-case"""
     return col.strip().lower().replace(" ", "_")
 
 
@@ -75,8 +74,7 @@ def _std_cols(df: pd.DataFrame, mapping: dict[str, List[str]], fname: str) -> pd
     for canon, aliases in mapping.items():
         hits = [c for c in df.columns if _n(c) in {_n(canon), *map(_n, aliases)}]
         if not hits:
-            # we *don’t* raise here for customer because we’ll inject a placeholder later
-            if canon == "customer":
+            if canon == "customer":          # we’ll inject later if absent
                 continue
             raise ValueError(f"Required column '{canon}' not found in {fname}")
         keep, dupes = hits[0], hits[1:]
@@ -87,9 +85,9 @@ def _std_cols(df: pd.DataFrame, mapping: dict[str, List[str]], fname: str) -> pd
 
 
 def _assert_cols(df: pd.DataFrame, cols: List[str], tag: str) -> None:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"{tag} missing columns: {missing}")
+    miss = [c for c in cols if c not in df.columns]
+    if miss:
+        raise ValueError(f"{tag} missing columns: {miss}")
 
 
 def _agg(df: pd.DataFrame, by: List[str], src: str, tgt: str) -> pd.DataFrame:
@@ -112,7 +110,7 @@ def _read_any(buf, fname: str, **kw) -> pd.DataFrame:
         return pd.read_excel(buf, engine="openpyxl", **kw)
     if ext == ".csv":
         return pd.read_csv(buf, encoding_errors="replace", **kw)
-    raise ValueError(f"Unsupported file type: {ext} for {fname}")
+    raise ValueError(f"Unsupported file type {ext} for {fname}")
 
 # ───────────────────────────── LOADERS
 def _load_supplier(buf, fname: str) -> pd.DataFrame:
@@ -130,7 +128,6 @@ def _load_raw(buf, fname: str) -> pd.DataFrame:
     df = _read_any(buf, fname)
     df.columns = [_n(c) for c in df.columns]
     df = _std_cols(df, CFG.SCHEMA["raw"], fname)
-    # guarantee a customer column
     if "customer" not in df.columns:
         st.warning(f"No 'customer' column in {fname} — using <nan>")
         df["customer"] = "<nan>"
@@ -143,13 +140,31 @@ def _load_raw(buf, fname: str) -> pd.DataFrame:
     return df[["customer", "carrier", "realm", "data_mb"]]
 
 
+# ------------- NEW  auto-header detection for billing file -------------
+def _find_hdr_row(buf, fname: str, max_rows: int = 12) -> int:
+    """scan first *max_rows* rows and return the first that looks like a header"""
+    sniff = pd.read_excel(buf, header=None, nrows=max_rows, engine="openpyxl")
+    buf.seek(0)
+    needed = {"customer_code", "customer", "qty", "product", "product/service"}
+    for idx, row in sniff.iterrows():
+        cols = {_n(str(c)) for c in row.values if str(c) != "nan"}
+        if len(needed.intersection(cols)) >= 2:   # good enough
+            return idx
+    st.warning(f"Couldn’t auto-detect header in {fname}, falling back to row {CFG.BILL_HDR+1}")
+    return CFG.BILL_HDR
+# -----------------------------------------------------------------------
+
+
 def _load_billing(buf, fname: str) -> pd.DataFrame:
-    df = _read_any(buf, fname, header=CFG.BILL_HDR)
+    hdr = _find_hdr_row(buf, fname)
+    df  = _read_any(buf, fname, header=hdr)
     df.columns = [_n(c) for c in df.columns]
     df = _std_cols(df, CFG.SCHEMA["billing"], fname)
+
     if "customer" not in df.columns:
         st.warning(f"No 'customer' column in {fname} — using <nan>")
         df["customer"] = "<nan>"
+
     df["qty"]      = _coerce_numeric(df["qty"])
     df["customer"] = (df["customer"].astype(str)
                                    .str.strip()
@@ -158,14 +173,15 @@ def _load_billing(buf, fname: str) -> pd.DataFrame:
                    .str.extract(CFG.REALM_RX)[0]
                    .str.lower()
                    .fillna("<nan>"))
+
     is_bundle = df["product"].str.contains("bundle", case=False, na=False)
     is_excess = df["product"].str.contains("excess", case=False, na=False) & ~is_bundle
     df["bundle_mb"] = np.where(is_bundle, df["qty"], 0.0)
     df["excess_mb"] = np.where(is_excess, df["qty"], 0.0)
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
+
     _assert_cols(df, ["customer", "realm", "billed_mb"], fname)
     return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
-
 
 # ───────────────────────────── COMPARISON
 def _compare(l: pd.DataFrame, r: pd.DataFrame,
@@ -202,7 +218,7 @@ run_clicked = st.button("Run", disabled=busy or not all((f_sup, f_raw, f_bill)))
 
 if run_clicked:
     st.session_state["busy"] = True
-    with st.spinner("Reconciling… this can take a minute"):
+    with st.spinner("Reconciling… hang tight"):
         try:
             sup  = _load_supplier(f_sup,  f_sup.name)
             raw  = _load_raw(    f_raw,  f_raw.name)
