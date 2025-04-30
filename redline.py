@@ -106,8 +106,9 @@ def _std_cols(df: pd.DataFrame,
 
     missing = [c for c in mapping if c not in df.columns]
     if missing:
-        raise ValueError(f"Required column '{missing[0]}' not found in "
-                         f“{file_name}”")
+        raise ValueError(
+            f"Required column '{missing[0]}' not found in {file_name}"
+        )
     return df
 
 
