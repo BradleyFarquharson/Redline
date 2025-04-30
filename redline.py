@@ -135,25 +135,67 @@ def _load_raw(buf, fname: str) -> pd.DataFrame:
     return df[["customer", "carrier", "realm", "data_mb"]]
 
 
+# ───────────────────────────────  LOAD BILLING  (auto-header version)
 def _load_billing(buf, fname: str) -> pd.DataFrame:
-    df = _read_any(buf, fname, header=CFG.BILL_HDR)
+    """
+    Read the Customer-Billing report, automatically locating the real header
+    row (the one that contains something like “Customer Code” / “Customer”),
+    then return a tidy DataFrame with: customer | realm | bundle_mb |
+    excess_mb | billed_mb
+    """
+    # ------------------------------------------------------------------ find header
+    raw_file = buf.getvalue()            # cache file bytes so we can rewind
+    for hdr in range(8):                 # look at the first 8 rows – plenty
+        try:
+            tmp = pd.read_excel(io.BytesIO(raw_file),
+                                engine="openpyxl",
+                                header=hdr,
+                                nrows=1)  # only need the column names
+        except Exception:
+            continue                     # not an Excel file? will explode later
+        norm_cols = [_n(c) for c in tmp.columns]
+        if {"customer", "customer_code", "customer_co"} & set(norm_cols):
+            CFG_found = hdr
+            break
+    else:
+        raise ValueError(
+            f"Couldn’t locate header row in {fname}. "
+            "Make sure it’s an unfiltered Sage/BCC “Sales by Customer Detail” export."
+        )
+
+    # ------------------------------------------------------------------ normal load
+    df = _read_any(io.BytesIO(raw_file), fname, header=CFG_found)
     df.columns = [_n(c) for c in df.columns]
-    df = _std_cols(df, CFG.SCHEMA["billing"], fname)
+    df = _std_cols(df, CFG.SCHEMA["billing"], fname)    # ensures “customer”, “product”, “qty”
+
+    # quantities ──────────────────────────────────────────────────────────────
     df["qty"]      = _coerce_numeric(df["qty"])
     df["customer"] = (df["customer"].astype(str)
                                    .str.strip()
                                    .replace({"": "<nan>", "nan": "<nan>"}))
+
+    # realm from product/service  (“Carrier – ZA 3 …”  etc.)
     df["realm"] = (df["product"].astype(str)
                    .str.extract(CFG.REALM_RX)[0]
                    .str.lower()
                    .fillna("<nan>"))
+
+    # classify bundle / excess
     is_bundle = df["product"].str.contains("bundle", case=False, na=False)
     is_excess = df["product"].str.contains("excess", case=False, na=False) & ~is_bundle
     df["bundle_mb"] = np.where(is_bundle, df["qty"], 0.0)
     df["excess_mb"] = np.where(is_excess, df["qty"], 0.0)
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
-    return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
 
+    required = ["customer", "realm", "billed_mb"]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{fname}: after processing, the following required column(s) "
+            f"are still missing → {missing}. Check the report export."
+        )
+
+    return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
 
 # ───────────────────────────────  COMPARISON
 def _compare(l: pd.DataFrame, r: pd.DataFrame,
