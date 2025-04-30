@@ -186,30 +186,60 @@ def _load_raw(buf: IO[bytes], name: str) -> pd.DataFrame:
 
 
 @st.cache_data(hash_funcs={io.BytesIO: lambda _: None}, show_spinner=False)
-def _load_billing(buf: IO[bytes], name: str) -> pd.DataFrame:
-    b = buf.getvalue()  # cache bytes so we only read once
+def _find_header_row(buf: io.BytesIO, file_name: str,
+                     max_scan: int = 30) -> int:
+    """
+    Return the row-index whose *normalised* cells contain at least one
+    of the customer aliases – that is the actual header row.
+    """
+    aliases = { _n(a) for a in CFG.SCHEMA["billing"]["customer"] }
+    # read the first `max_scan` rows *without* header
+    peek = pd.read_excel(buf, nrows=max_scan, header=None, engine=None)
+    buf.seek(0)                                    # rewind for the real read
 
-    hdr_row = _find_hdr_row(b)
-    df = _read_any(io.BytesIO(b), name, header=hdr_row)
-    df = _std_cols(df, "billing", name)
+    norm = peek.fillna("").astype(str).applymap(_n)
+    hits = norm.apply(lambda col: col.isin(aliases))
+    if not hits.values.any():
+        # fall back to row CFG.BILL_HDR and let std_cols raise if needed
+        return CFG.BILL_HDR
 
+    return hits.any(1).idxmax()           # first row containing an alias
+
+
+def _load_billing(buf, file_name: str) -> pd.DataFrame:
+    """Load and process billing data (Customer Detail export)."""
+    hdr = _find_header_row(buf, file_name)
+    df  = _read_any(buf, file_name, header=hdr)    # second, clean read
+    df.columns = [_n(c) for c in df.columns]
+    df = _std_cols(df, CFG.SCHEMA["billing"], file_name)
+
+    # --- (rest identical) ---------------------------------------------
     df["qty"] = _coerce_numeric(df["qty"])
-    df["customer"] = (
-        df["customer"].astype(str).str.strip().replace({"": "<nan>", "nan": "<nan>"})
-    )
-    df["realm"] = (
-        df["product"].astype(str).str.extract(CFG.REALM_RX)[0].str.lower().fillna("<nan>")
-    )
+    if (df["qty"] < 0).any():
+        st.warning(f"Negative values found in 'qty' for {file_name}")
 
-    is_bundle = df["product"].str.contains("bundle", case=False, na=False)
-    is_excess = df["product"].str.contains("excess", case=False, na=False) & ~is_bundle
+    df["customer"] = (df["customer"].astype(str)
+                                   .str.strip()
+                                   .replace({"": "<nan>", "nan": "<nan>"}))
 
-    df["bundle_mb"] = np.where(is_bundle, df["qty"], 0.0)
-    df["excess_mb"] = np.where(is_excess, df["qty"], 0.0)
+    df["realm"] = (df["product"].astype(str)
+                               .str.extract(CFG.REALM_RX)[0]
+                               .str.lower()
+                               .fillna("<nan>"))
+
+    unmatched = df["realm"].eq("<nan>").sum()
+    if unmatched:
+        st.warning(f"{unmatched} products did not match realm pattern "
+                   f"in {file_name}")
+
+    is_bundle = df["product"].str.contains("bundle",  case=False, na=False)
+    is_excess = df["product"].str.contains("excess",  case=False, na=False) & ~is_bundle
+    df["bundle_mb"] = np.where(is_bundle, df["qty"],   0.0)
+    df["excess_mb"] = np.where(is_excess, df["qty"],   0.0)
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
 
-    return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
-
+    return df[["customer", "realm",
+               "bundle_mb", "excess_mb", "billed_mb"]]
 
 # ────────────────────────── AGG & COMPARE ──────────────────────
 def _agg(df: pd.DataFrame, by: list[str], src: str, tgt: str) -> pd.DataFrame:
