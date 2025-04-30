@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Redline — SIM-Bundle Reconciliation  v2.4.2
-------------------------------------------
-Compares Supplier summaries, iONLINE raw logs and Customer Billing.
-Outputs three delta tables and a formatted Excel workbook.
+Redline — SIM-Bundle Reconciliation  v2.5
+----------------------------------------
+Minimal Streamlit UI (upload → run → download).
+Outputs an Excel workbook with a dashboard Summary tab and three
+detail tabs:
+    • Supplier_vs_Raw
+    • Supplier_vs_Customer
+    • Raw_vs_Customer
 """
 from __future__ import annotations
 import datetime as dt, io, re
@@ -28,9 +32,10 @@ class Config:
     CUSTOMER: Threshold = Threshold(10, 50)
 
     BILLING_HEADER_ROW: Final[int] = 4
-    REGEX_REALM: Final[re.Pattern] = re.compile(r'(?:\s-\s|:\s)([A-Za-z]{2}\s?\d+)$', re.I)
-    REGEX_TOTAL: Final[re.Pattern] = re.compile(r'grand\s+total', re.I)
+    REGEX_REALM:  Final[re.Pattern] = re.compile(r'(?:\s-\s|:\s)([A-Za-z]{2}\s?\d+)$', re.I)
+    REGEX_TOTAL:  Final[re.Pattern] = re.compile(r'grand\s+total', re.I)
 
+    # canonical-name → aliases
     SCHEMA: Final[dict[str, dict[str, list[str]]]] = field(default_factory=lambda: {
         "supplier": {
             "carrier":  ["carrier"],
@@ -54,20 +59,19 @@ class Config:
             "qty":      ["qty", "quantity"],
         },
     })
-
     AUTO_WIDTH: Final[bool] = True
 
 
 CFG = Config()               # singleton
 
 # ───────────────── Helper utils
-def _seek_start(buf):                                        # rewind pointer
+def _seek_start(buf):  # rewind pointer safely
     try: buf.seek(0)
     except Exception: pass
 
 
 def _std_cols(df: pd.DataFrame, mapping: dict[str, list[str]]) -> pd.DataFrame:
-    df = df.copy(); drops = []
+    df = df.copy(); drops=[]
     norm = lambda s: s.strip().lower().replace(" ", "_")
     for canon, aliases in mapping.items():
         hits = [c for c in df.columns if norm(c) in {norm(canon), *map(norm, aliases)}]
@@ -81,12 +85,12 @@ def _std_cols(df: pd.DataFrame, mapping: dict[str, list[str]]) -> pd.DataFrame:
                 df = df.rename(columns={keep: canon})
         drops.extend(h for h in hits[1:] if h != canon)
     df = df.drop(columns=list(set(drops)))
-    df = df.loc[:, ~df.columns.duplicated()]                 # final guard-rail
+    df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 
-def _to_float(s: pd.Series) -> pd.Series:                    # safe numeric cast
-    return pd.to_numeric(s.astype(str), errors='coerce').fillna(0.0)
+def _to_float(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s.astype(str), errors="coerce").fillna(0.0)
 
 
 def _categorise(df: pd.DataFrame, cols: List[str]):
@@ -104,7 +108,7 @@ def _read_any(buf, **kw) -> pd.DataFrame:
         return pd.read_csv(buf, encoding_errors="replace", **kw)
     raise ValueError(f"Unsupported file type: {name or '<buffer>'}")
 
-# ───────────────── Loaders (cached)
+# ───────────────── Loaders
 @st.cache_data(show_spinner="Reading supplier file…")
 def load_supplier(buf):
     df = _read_any(buf)
@@ -145,8 +149,8 @@ def load_billing(buf):
     df["bundle_mb"] = df["excess_mb"] = 0.0
     is_bundle = prod.str.contains("bundle", case=False, na=False)
     is_excess = prod.str.contains("excess", case=False, na=False)
-    df.loc[is_bundle, "bundle_mb"]                = df.loc[is_bundle, "qty"]
-    df.loc[is_excess & ~is_bundle, "excess_mb"]   = df.loc[is_excess & ~is_bundle, "qty"]
+    df.loc[is_bundle,               "bundle_mb"] = df.loc[is_bundle, "qty"]
+    df.loc[is_excess & ~is_bundle,  "excess_mb"] = df.loc[is_excess & ~is_bundle, "qty"]
 
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
     _categorise(df, ["customer", "realm"])
@@ -154,13 +158,16 @@ def load_billing(buf):
 
 # ───────────────── Aggregation / comparison
 def _agg(df, by: List[str], src: str, tgt: str):
-    return df.groupby(by, as_index=False, observed=True)[src].sum().rename(columns={src: tgt})
+    return (df.groupby(by, as_index=False, observed=True)[src].sum()
+              .rename(columns={src: tgt}))
+
 
 def _status_series(delta: pd.Series, th: Threshold):
     bins   = [0, th.warn, th.fail, np.inf]
     labels = ["OK", "WARN", "FAIL"]
     return pd.cut(delta.abs(), bins=bins, labels=labels,
                   right=False, include_lowest=True).astype("category")
+
 
 def compare(left, right, on: List[str], lcol: str, rcol: str, th: Threshold):
     cmp = left.merge(right, on=on, how="outer")
@@ -172,6 +179,23 @@ def compare(left, right, on: List[str], lcol: str, rcol: str, th: Threshold):
     cmp["status"]    = _status_series(cmp["delta_mb"], th)
     _categorise(cmp, ["status"])
     return cmp[on + [lcol, rcol, "delta_mb", "pct_delta", "status"]]
+
+# ───────────────── Summary tab
+def make_summary(sup_vs_raw, sup_vs_cust, raw_vs_cust) -> pd.DataFrame:
+    rows = []
+    for name, df in [("Supplier vs Raw", sup_vs_raw),
+                     ("Supplier vs Customer", sup_vs_cust),
+                     ("Raw vs Customer", raw_vs_cust)]:
+        counts = df["status"].value_counts().reindex(["OK", "WARN", "FAIL"]).fillna(0).astype(int)
+        total_abs_mb = df["delta_mb"].abs().sum()
+        rows.append({
+            "Comparison":     name,
+            "OK":   counts.get("OK",   0),
+            "WARN": counts.get("WARN", 0),
+            "FAIL": counts.get("FAIL", 0),
+            "Total |Δ| MB":   round(total_abs_mb, 2),
+        })
+    return pd.DataFrame(rows)
 
 # ───────────────── Excel builder
 def create_excel(tabs: dict[str, pd.DataFrame]) -> bytes:
@@ -201,7 +225,8 @@ def create_excel(tabs: dict[str, pd.DataFrame]) -> bytes:
                     width = min(max(len(str(c)),
                                     df[c].astype(str).str.len().max()) + 2, 60)
                     ws.set_column(i, i, width)
-    buf.seek(0); return buf.read()
+    buf.seek(0)
+    return buf.read()
 
 # ───────────────── UI
 st.set_page_config(page_title="Redline Reconciliation", layout="centered")
@@ -213,30 +238,40 @@ st.markdown(
         content:"Drop or browse…"; position:absolute; top:45%; left:50%;
         transform:translate(-50%,-50%); font-size:0.9rem; color:white;
     }
-    .block-container {padding-top:1.2rem;}
+    .block-container {padding-top:1.3rem;}
     </style>
     """, unsafe_allow_html=True)
 
 st.title("Redline — Multi-Source Usage Reconciliation")
-st.caption("Compares Supplier, Raw Usage and Customer Billing data.")
+st.caption("Upload the three source files and click **Run** to download the reconciliation workbook.")
 
-c1, c2, c3 = st.columns(3)
-with c1: f_sup  = st.file_uploader("Supplier file", type=["csv","xls","xlsx"])
-with c2: f_raw  = st.file_uploader("Raw usage file", type=["csv","xls","xlsx"])
-with c3: f_bill = st.file_uploader("Billing file",   type=["csv","xls","xlsx"])
+# Uploaders: 2-column + full-width
+c1, c2 = st.columns(2, gap="medium")
+with c1:
+    f_supplier = st.file_uploader("Supplier file", type=["csv", "xls", "xlsx"], key="sup")
+with c2:
+    f_raw = st.file_uploader("Raw usage file", type=["csv", "xls", "xlsx"], key="raw")
 
-if st.button("Run Reconciliation", disabled=not all((f_sup,f_raw,f_bill)), type="primary"):
+st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)  # spacer
+f_billing = st.file_uploader("Billing file", type=["csv", "xls", "xlsx"], key="bill")
+
+st.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)  # spacer
+
+run = st.button("Run Reconciliation", disabled=not all((f_supplier, f_raw, f_billing)), type="primary")
+
+# ─── Main block
+if run:
     try:
-        sup  = load_supplier(f_sup)
+        sup  = load_supplier(f_supplier)
         raw  = load_raw(f_raw)
-        bill = load_billing(f_bill)
+        bill = load_billing(f_billing)
 
         sup_realm     = _agg(sup, ["carrier","realm"], "data_mb", "supplier_mb")
-        sup_realm_tot = _agg(sup, ["realm"],            "data_mb", "supplier_mb")
-        raw_realm     = _agg(raw, ["carrier","realm"],  "data_mb", "raw_mb")
-        raw_cust      = _agg(raw, ["customer","realm"], "data_mb", "raw_mb")
-        bill_realm    = _agg(bill, ["realm"],           "billed_mb", "customer_billed_mb")
-        bill_cust     = _agg(bill, ["customer","realm"],"billed_mb", "customer_billed_mb")
+        sup_realm_tot = _agg(sup, ["realm"],           "data_mb", "supplier_mb")
+        raw_realm     = _agg(raw, ["carrier","realm"], "data_mb", "raw_mb")
+        raw_cust      = _agg(raw, ["customer","realm"],"data_mb", "raw_mb")
+        bill_realm    = _agg(bill,["realm"],           "billed_mb","customer_billed_mb")
+        bill_cust     = _agg(bill,["customer","realm"],"billed_mb","customer_billed_mb")
 
         sup_vs_raw  = compare(sup_realm,     raw_realm,
                               ["carrier","realm"],
@@ -248,20 +283,19 @@ if st.button("Run Reconciliation", disabled=not all((f_sup,f_raw,f_bill)), type=
                               ["customer","realm"],
                               "raw_mb","customer_billed_mb", CFG.CUSTOMER)
 
-        st.subheader("Supplier vs Raw (carrier + realm)")
-        st.dataframe(sup_vs_raw,  use_container_width=True)
-        st.subheader("Supplier vs Billing (realm)")
-        st.dataframe(sup_vs_cust, use_container_width=True)
-        st.subheader("Raw vs Billing (customer + realm)")
-        st.dataframe(raw_vs_cust, use_container_width=True)
+        summary_df = make_summary(sup_vs_raw, sup_vs_cust, raw_vs_cust)
 
+        excel_bytes = create_excel({
+            "Summary":               summary_df,
+            "Supplier_vs_Raw":       sup_vs_raw,
+            "Supplier_vs_Customer":  sup_vs_cust,
+            "Raw_vs_Customer":       raw_vs_cust,
+        })
+
+        st.success("Reconciliation complete – download your workbook below.")
         st.download_button(
             "⬇️ Download Excel report",
-            create_excel({
-                "Supplier_vs_Raw":      sup_vs_raw,
-                "Supplier_vs_Customer": sup_vs_cust,
-                "Raw_vs_Customer":      raw_vs_cust,
-            }),
+            data=excel_bytes,
             file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
