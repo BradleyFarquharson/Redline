@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """
-Redline — SIM-Bundle Reconciliation  v2.5
-----------------------------------------
-Minimal Streamlit UI (upload → run → download).
-Outputs an Excel workbook with a dashboard Summary tab and three
-detail tabs:
-    • Supplier_vs_Raw
-    • Supplier_vs_Customer
-    • Raw_vs_Customer
+Redline — SIM-Bundle Reconciliation  v2.5.4
+==========================================
+
+Upload:
+    1. Supplier summary  (xls/xlsx/csv)
+    2. iONLINE raw usage (xls/xlsx/csv)
+    3. Customer billing  (xls/xlsx/csv)
+
+Click **Run** → get a single workbook with three sheets:
+    • Supplier vs Raw (carrier+realm)
+    • Supplier vs Customer (realm)
+    • Raw vs Customer (customer+realm)
+
+The sheet cells are traffic-lighted with the thresholds below.
 """
+
 from __future__ import annotations
-import datetime as dt, io, re
+
+import datetime as dt
+import io
+import re
+import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Final, List
 
 import numpy as np
@@ -19,289 +31,316 @@ import pandas as pd
 import streamlit as st
 import xlsxwriter
 
-# ───────────────── Threshold model
-@dataclass(frozen=True, slots=True)
+# ──────────────────────────────── Config & thresholds
+@dataclass(frozen=True)
 class Threshold:
     warn: int
     fail: int
 
-# ───────────────── Configuration
-@dataclass(frozen=True, slots=True)
+
+@dataclass(frozen=True)
 class Config:
     REALM:    Threshold = Threshold(5, 20)
     CUSTOMER: Threshold = Threshold(10, 50)
 
+    # Header row (0-based) for the billing file – row 5 in Excel
     BILLING_HEADER_ROW: Final[int] = 4
-    REGEX_REALM:  Final[re.Pattern] = re.compile(r'(?:\s-\s|:\s)([A-Za-z]{2}\s?\d+)$', re.I)
-    REGEX_TOTAL:  Final[re.Pattern] = re.compile(r'grand\s+total', re.I)
 
-    # canonical-name → aliases
-    SCHEMA: Final[dict[str, dict[str, list[str]]]] = field(default_factory=lambda: {
-        "supplier": {
-            "carrier":  ["carrier"],
-            "realm":    ["realm"],
-            "subs_qty": ["subscription_qty", "subscription", "subs_qty", "qty"],
-            "data_mb":  ["total_mb", "data_mb", "usage_mb"],
-        },
-        "raw": {
-            "date":     ["date"],
-            "msisdn":   ["msisdn"],
-            "sim":      ["sim_serial", "sim"],
-            "customer": ["customer_code", "customer"],
-            "realm":    ["realm"],
-            "carrier":  ["carrier"],
-            "data_mb":  ["total_usage_(mb)", "total_usage_mb", "usage_mb", "data_mb"],
-            "status":   ["status"],
-        },
-        "billing": {
-            "customer": ["customer_co", "customer_code", "customer"],
-            "product":  ["product/service", "product_service", "product"],
-            "qty":      ["qty", "quantity"],
-        },
-    })
-    AUTO_WIDTH: Final[bool] = True
+    # Regex to yank realm from “Product/Service” in billing
+    REGEX_REALM: Final[re.Pattern] = re.compile(r"(?<=\s-\s)([A-Za-z]{2}\s?\w+)", re.I)
+
+    # Canonical schema (aliases)
+    SCHEMA: Final[dict[str, dict[str, list[str]]]] = field(
+        default_factory=lambda: {
+            "supplier": {
+                "carrier": ["carrier"],
+                "realm":   ["realm"],
+                "data_mb": ["total_mb", "usage_mb", "data_mb"],
+            },
+            "raw": {
+                "date":     ["date"],
+                "msisdn":   ["msisdn"],
+                "sim":      ["sim_serial", "sim"],
+                "customer": ["customer_code", "customer"],
+                "realm":    ["realm"],
+                "carrier":  ["carrier"],
+                "data_mb":  ["total_usage_(mb)", "total_usage_mb", "usage_mb", "data_mb"],
+            },
+            "billing": {
+                "customer": ["customer_code", "customer"],
+                "product":  ["product/service", "product_service", "product"],
+                "qty":      ["qty", "quantity"],
+            },
+        }
+    )
+
+    AUTO_WIDTH: Final[bool] = True   # auto-size cols in XLSX
 
 
-CFG = Config()               # singleton
+CFG = Config()  # ──────────────────────────────────────────────────────────────
 
-# ───────────────── Helper utils
-def _seek_start(buf):  # rewind pointer safely
-    try: buf.seek(0)
-    except Exception: pass
+
+# ──────────────────────────────── Generic helpers
+def _seek_start(buf):
+    try:
+        buf.seek(0)
+    except Exception:
+        pass
+
+
+def _clean_key(s: pd.Series, lower: bool = True) -> pd.Series:
+    """
+    Collapse *all* exotic whitespace, strip, and normalise unicode so
+    "abc " == "abc" == "ABC".
+    """
+    out = (
+        s.fillna("")
+        .astype(str)
+        .apply(lambda x: unicodedata.normalize("NFKC", x))
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    return out.str.lower() if lower else out
+
+
+def _coerce_numeric(s: pd.Series) -> pd.Series:
+    if s.empty:
+        return s
+    cleaned = (
+        s.fillna("")
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .replace({"-": "0", "": "0"})
+    )
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0.0).astype(float)
 
 
 def _std_cols(df: pd.DataFrame, mapping: dict[str, list[str]]) -> pd.DataFrame:
-    df = df.copy(); drops=[]
-    norm = lambda s: s.strip().lower().replace(" ", "_")
-    for canon, aliases in mapping.items():
-        hits = [c for c in df.columns if norm(c) in {norm(canon), *map(norm, aliases)}]
+    df = df.copy()
+    cols2drop = []
+    lookups = {k: {k, *(a.lower().replace(" ", "_") for a in v)}
+               for k, v in mapping.items()}
+
+    for canon, aliases in lookups.items():
+        hits = [c for c in df.columns if c.lower().replace(" ", "_") in aliases]
         if not hits:
-            raise ValueError(f"Required column '{canon}' missing")
+            raise ValueError(f"Missing required column '{canon}'.")
         keep = hits[0]
         if keep != canon:
-            if canon in df.columns:
-                drops.append(keep)
-            else:
-                df = df.rename(columns={keep: canon})
-        drops.extend(h for h in hits[1:] if h != canon)
-    df = df.drop(columns=list(set(drops)))
-    df = df.loc[:, ~df.columns.duplicated()]
+            df = df.rename(columns={keep: canon})
+        cols2drop.extend(hits[1:])
+
+    if cols2drop:
+        df = df.drop(columns=cols2drop)
     return df
 
 
-def _to_float(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s.astype(str), errors="coerce").fillna(0.0)
+def _assert_keys(df: pd.DataFrame, keys: List[str], name="DataFrame"):
+    missing = [k for k in keys if k not in df.columns]
+    if missing:
+        raise ValueError(f"{name} missing column(s): {missing}")
 
 
-def _categorise(df: pd.DataFrame, cols: List[str]):
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype("category")
+def _agg(df: pd.DataFrame, by: List[str], src: str, tgt: str) -> pd.DataFrame:
+    _assert_keys(df, by + [src], "agg() input")
+    # fill NaNs in keys *after* converting to object to avoid Categorical errors
+    filled = df.copy()
+    for k in by:
+        if filled[k].isnull().any():
+            filled[k] = filled[k].astype(object).fillna("<nan>")
+    return (
+        filled.groupby(by, as_index=False, observed=True)[src]
+        .sum()
+        .rename(columns={src: tgt})
+    )
 
 
-def _read_any(buf, **kw) -> pd.DataFrame:
+def _status_series(delta: pd.Series, th: Threshold) -> pd.Series:
+    absd = delta.abs()
+    bins = [0, th.warn, th.fail, np.inf]
+    labels = ["OK", "WARN", "FAIL"]
+    return pd.cut(absd, bins=bins, labels=labels, right=False,
+                  include_lowest=True).astype("category")
+
+
+# ──────────────────────────────── File loaders
+def _load_excel_or_csv(buf, **kw) -> pd.DataFrame:
     _seek_start(buf)
-    name = getattr(buf, "name", "").lower()
+    name = getattr(buf, "name", "file").lower()
     if name.endswith((".xls", ".xlsx")):
         return pd.read_excel(buf, engine="openpyxl", **kw)
-    if name.endswith(".csv"):
-        return pd.read_csv(buf, encoding_errors="replace", **kw)
-    raise ValueError(f"Unsupported file type: {name or '<buffer>'}")
+    return pd.read_csv(buf, encoding_errors="replace", **kw)
 
-# ───────────────── Loaders
-@st.cache_data(show_spinner="Reading supplier file…")
-def load_supplier(buf):
-    df = _read_any(buf)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+def load_supplier(buf) -> pd.DataFrame:
+    df = _load_excel_or_csv(buf)
+    df.columns = _clean_key(pd.Series(df.columns), lower=True)
     df = _std_cols(df, CFG.SCHEMA["supplier"])
-    df = df[~df["realm"].astype(str).str.match(CFG.REGEX_TOTAL, na=False)]
-    df["carrier"] = df["carrier"].astype(str).str.upper()
-    df["realm"]   = df["realm"].astype(str).str.lower()
-    df["data_mb"] = _to_float(df["data_mb"])
-    _categorise(df, ["carrier", "realm"])
+
+    df["carrier"] = _clean_key(df["carrier"], lower=False).str.upper()
+    df["realm"] = _clean_key(df["realm"])
+    df["data_mb"] = _coerce_numeric(df["data_mb"])
+
+    _assert_keys(df, ["carrier", "realm", "data_mb"], "Supplier")
     return df[["carrier", "realm", "data_mb"]]
 
 
-@st.cache_data(show_spinner="Reading raw usage file…")
-def load_raw(buf):
-    df = _read_any(buf)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+def load_raw(buf) -> pd.DataFrame:
+    df = _load_excel_or_csv(buf)
+    df.columns = _clean_key(pd.Series(df.columns), lower=True)
     df = _std_cols(df, CFG.SCHEMA["raw"])
-    df["data_mb"]  = _to_float(df["data_mb"])
-    df["realm"]    = df["realm"].astype(str).str.lower()
-    df["carrier"]  = df["carrier"].astype(str).str.upper().fillna("UNKNOWN")
-    df["customer"] = df["customer"].astype(str).fillna("<nan>")
-    _categorise(df, ["customer", "realm", "carrier"])
-    return df[["customer", "realm", "carrier", "data_mb"]]
+
+    df["carrier"] = _clean_key(df["carrier"], lower=False).str.upper().replace("", "<nan>")
+    df["realm"]   = _clean_key(df["realm"]).replace("", "<nan>")
+    df["customer"] = _clean_key(df["customer"]).replace("", "<nan>")
+    df["data_mb"]  = _coerce_numeric(df["data_mb"])
+
+    _assert_keys(df, ["carrier", "realm", "customer", "data_mb"], "Raw usage")
+    return df[["carrier", "realm", "customer", "data_mb"]]
 
 
-@st.cache_data(show_spinner="Reading billing file…")
-def load_billing(buf):
-    df = _read_any(buf, header=CFG.BILLING_HEADER_ROW)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+def load_billing(buf) -> pd.DataFrame:
+    df = _load_excel_or_csv(buf, header=CFG.BILLING_HEADER_ROW)
+    df.columns = _clean_key(pd.Series(df.columns), lower=True)
     df = _std_cols(df, CFG.SCHEMA["billing"])
-    df["qty"]      = _to_float(df["qty"])
-    df["customer"] = df["customer"].astype(str).fillna("<nan>")
 
+    df["customer"] = _clean_key(df["customer"]).replace("", "<nan>")
+    df["qty"] = _coerce_numeric(df["qty"])
+
+    # derive realm from product
     prod = df["product"].astype(str)
-    df["realm"] = prod.str.extract(CFG.REGEX_REALM, expand=False).str.lower().fillna("<nan>")
+    df["realm"] = prod.str.extract(CFG.REGEX_REALM)[0]
+    df["realm"] = _clean_key(df["realm"]).replace("", "<nan>")
 
-    df["bundle_mb"] = df["excess_mb"] = 0.0
+    # classify bundle / excess
     is_bundle = prod.str.contains("bundle", case=False, na=False)
     is_excess = prod.str.contains("excess", case=False, na=False)
-    df.loc[is_bundle,               "bundle_mb"] = df.loc[is_bundle, "qty"]
-    df.loc[is_excess & ~is_bundle,  "excess_mb"] = df.loc[is_excess & ~is_bundle, "qty"]
-
+    df["bundle_mb"] = df["qty"].where(is_bundle, 0.0)
+    df["excess_mb"] = df["qty"].where(is_excess & ~is_bundle, 0.0)
     df["billed_mb"] = df["bundle_mb"] + df["excess_mb"]
-    _categorise(df, ["customer", "realm"])
-    return df[["customer", "realm", "bundle_mb", "excess_mb", "billed_mb"]]
 
-# ───────────────── Aggregation / comparison
-def _agg(df, by: List[str], src: str, tgt: str):
-    return (df.groupby(by, as_index=False, observed=True)[src].sum()
-              .rename(columns={src: tgt}))
+    _assert_keys(df, ["customer", "realm", "billed_mb"], "Billing")
+    return df[["customer", "realm", "billed_mb"]]
 
 
-def _status_series(delta: pd.Series, th: Threshold):
-    bins   = [0, th.warn, th.fail, np.inf]
-    labels = ["OK", "WARN", "FAIL"]
-    return pd.cut(delta.abs(), bins=bins, labels=labels,
-                  right=False, include_lowest=True).astype("category")
+# ──────────────────────────────── Compare & Excel
+def compare(left: pd.DataFrame, right: pd.DataFrame, on: List[str],
+            lcol: str, rcol: str, th: Threshold) -> pd.DataFrame:
+    _assert_keys(left, on + [lcol], "compare:left")
+    _assert_keys(right, on + [rcol], "compare:right")
+    cmp = pd.merge(left, right, on=on, how="outer", copy=False)
+
+    cmp[lcol] = _coerce_numeric(cmp[lcol].fillna(0.0))
+    cmp[rcol] = _coerce_numeric(cmp[rcol].fillna(0.0))
+    for k in on:
+        if cmp[k].isnull().any():
+            cmp[k] = cmp[k].astype(object).fillna("<nan>")
+
+    cmp["delta_mb"] = cmp[lcol] - cmp[rcol]
+    denom = cmp[[lcol, rcol]].max(axis=1).replace(0, np.nan)
+    cmp["pct_delta"] = (cmp["delta_mb"] / denom) * 100
+    cmp["pct_delta"] = cmp["pct_delta"].round(6).fillna(0)
+    cmp["status"] = _status_series(cmp["delta_mb"], th)
+
+    order = on + [lcol, rcol, "delta_mb", "pct_delta", "status"]
+    return cmp[order]
 
 
-def compare(left, right, on: List[str], lcol: str, rcol: str, th: Threshold):
-    cmp = left.merge(right, on=on, how="outer")
-    cmp[lcol] = _to_float(cmp[lcol])
-    cmp[rcol] = _to_float(cmp[rcol])
-    cmp["delta_mb"]  = cmp[lcol] - cmp[rcol]
-    cmp["pct_delta"] = np.where(cmp[rcol] == 0, np.nan,
-                                cmp["delta_mb"] / cmp[rcol] * 100)
-    cmp["status"]    = _status_series(cmp["delta_mb"], th)
-    _categorise(cmp, ["status"])
-    return cmp[on + [lcol, rcol, "delta_mb", "pct_delta", "status"]]
-
-# ───────────────── Summary tab
-def make_summary(sup_vs_raw, sup_vs_cust, raw_vs_cust) -> pd.DataFrame:
-    rows = []
-    for name, df in [("Supplier vs Raw", sup_vs_raw),
-                     ("Supplier vs Customer", sup_vs_cust),
-                     ("Raw vs Customer", raw_vs_cust)]:
-        counts = df["status"].value_counts().reindex(["OK", "WARN", "FAIL"]).fillna(0).astype(int)
-        total_abs_mb = df["delta_mb"].abs().sum()
-        rows.append({
-            "Comparison":     name,
-            "OK":   counts.get("OK",   0),
-            "WARN": counts.get("WARN", 0),
-            "FAIL": counts.get("FAIL", 0),
-            "Total |Δ| MB":   round(total_abs_mb, 2),
-        })
-    return pd.DataFrame(rows)
-
-# ───────────────── Excel builder
 def create_excel(tabs: dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
         wb = xl.book
-        colours = {"OK": "#C6EFCE", "WARN": "#FFEB9C", "FAIL": "#FFC7CE"}
-        txt     = {"OK": "#006100", "WARN": "#9C6500", "FAIL": "#9C0006"}
-        fmt     = {k: wb.add_format({"bg_color": v, "font_color": txt[k], "bold": True})
-                   for k, v in colours.items()}
-        numfmt = wb.add_format({"num_format": "#,##0.00"})
+        fmt = {
+            k: wb.add_format({"bg_color": c, "font_color": t, "bold": True})
+            for k, c, t in [
+                ("OK",   "#C6EFCE", "#006100"),
+                ("WARN", "#FFEB9C", "#9C6500"),
+                ("FAIL", "#FFC7CE", "#9C0006"),
+            ]
+        }
+        numfmt = wb.add_format({"num_format": "0.00"})
 
-        for name, df in tabs.items():
-            if df.empty: continue
-            df.to_excel(xl, sheet_name=name[:31], index=False)
-            ws = xl.sheets[name[:31]]
+        for sheet, df in tabs.items():
+            df.to_excel(xl, sheet_name=sheet[:31], index=False)
+            ws = xl.sheets[sheet[:31]]
+
             if "status" in df.columns:
                 col = df.columns.get_loc("status")
+                n = len(df)
                 for k, f in fmt.items():
-                    ws.conditional_format(1, col, len(df), col,
-                                          {"type": "cell", "criteria": "==",
-                                           "value": f'"{k}"', "format": f})
+                    ws.conditional_format(1, col, n, col, {
+                        "type": "cell", "criteria": "==", "value": f'"{k}"', "format": f,
+                    })
+
             for i, c in enumerate(df.columns):
                 if pd.api.types.is_numeric_dtype(df[c]):
                     ws.set_column(i, i, None, numfmt)
                 if CFG.AUTO_WIDTH:
-                    width = min(max(len(str(c)),
-                                    df[c].astype(str).str.len().max()) + 2, 60)
+                    width = min(60, max(len(str(c)), df[c].astype(str).str.len().max()) + 2)
                     ws.set_column(i, i, width)
+
     buf.seek(0)
     return buf.read()
 
-# ───────────────── UI
+
+# ──────────────────────────────── Streamlit UI
 st.set_page_config(page_title="Redline Reconciliation", layout="centered")
-st.markdown(
-    """
-    <style>
-    div[data-testid="stFileDropzone"] > div > span {visibility:hidden;}
-    div[data-testid="stFileDropzone"]::before {
-        content:"Drop or browse…"; position:absolute; top:45%; left:50%;
-        transform:translate(-50%,-50%); font-size:0.9rem; color:white;
-    }
-    .block-container {padding-top:1.3rem;}
-    </style>
-    """, unsafe_allow_html=True)
 
 st.title("Redline — Multi-Source Usage Reconciliation")
-st.caption("Upload the three source files and click **Run** to download the reconciliation workbook.")
+st.caption("Upload the three source files and click **Run** to download the result.")
 
-# Uploaders: 2-column + full-width
-c1, c2 = st.columns(2, gap="medium")
-with c1:
-    f_supplier = st.file_uploader("Supplier file", type=["csv", "xls", "xlsx"], key="sup")
-with c2:
+col_sup, col_raw = st.columns(2)
+with col_sup:
+    f_sup = st.file_uploader("Supplier file", type=["csv", "xls", "xlsx"], key="sup")
+with col_raw:
     f_raw = st.file_uploader("Raw usage file", type=["csv", "xls", "xlsx"], key="raw")
 
-st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)  # spacer
-f_billing = st.file_uploader("Billing file", type=["csv", "xls", "xlsx"], key="bill")
+f_bill = st.file_uploader("Billing file", type=["csv", "xls", "xlsx"], key="bill")
 
-st.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)  # spacer
+run = st.button("Run", disabled=not all((f_sup, f_raw, f_bill)))
 
-run = st.button("Run Reconciliation", disabled=not all((f_supplier, f_raw, f_billing)), type="primary")
-
-# ─── Main block
 if run:
-    try:
-        sup  = load_supplier(f_supplier)
-        raw  = load_raw(f_raw)
-        bill = load_billing(f_billing)
+    with st.spinner("Processing…"):
+        try:
+            sup  = load_supplier(f_sup)
+            raw  = load_raw(f_raw)
+            bill = load_billing(f_bill)
 
-        sup_realm     = _agg(sup, ["carrier","realm"], "data_mb", "supplier_mb")
-        sup_realm_tot = _agg(sup, ["realm"],           "data_mb", "supplier_mb")
-        raw_realm     = _agg(raw, ["carrier","realm"], "data_mb", "raw_mb")
-        raw_cust      = _agg(raw, ["customer","realm"],"data_mb", "raw_mb")
-        bill_realm    = _agg(bill,["realm"],           "billed_mb","customer_billed_mb")
-        bill_cust     = _agg(bill,["customer","realm"],"billed_mb","customer_billed_mb")
+            # ── Aggregations
+            sup_car_realm = _agg(sup,  ["carrier", "realm"],          "data_mb", "supplier_mb")
+            sup_realm     = _agg(sup,  ["realm"],                     "data_mb", "supplier_mb")
+            raw_car_realm = _agg(raw,  ["carrier", "realm"],          "data_mb", "raw_mb")
+            raw_cust      = _agg(raw,  ["customer", "realm"],         "data_mb", "raw_mb")
+            bill_realm    = _agg(bill, ["realm"],                     "billed_mb", "customer_billed_mb")
+            bill_cust     = _agg(bill, ["customer", "realm"],         "billed_mb", "customer_billed_mb")
 
-        sup_vs_raw  = compare(sup_realm,     raw_realm,
-                              ["carrier","realm"],
-                              "supplier_mb","raw_mb", CFG.REALM)
-        sup_vs_cust = compare(sup_realm_tot, bill_realm,
-                              ["realm"],
-                              "supplier_mb","customer_billed_mb", CFG.REALM)
-        raw_vs_cust = compare(raw_cust,      bill_cust,
-                              ["customer","realm"],
-                              "raw_mb","customer_billed_mb", CFG.CUSTOMER)
+            # ── Comparisons
+            cmp_sup_raw   = compare(sup_car_realm, raw_car_realm, ["carrier", "realm"],
+                                    "supplier_mb", "raw_mb", CFG.REALM)
+            cmp_sup_bill  = compare(sup_realm,     bill_realm,    ["realm"],
+                                    "supplier_mb", "customer_billed_mb", CFG.REALM)
+            cmp_raw_bill  = compare(raw_cust,      bill_cust,     ["customer", "realm"],
+                                    "raw_mb", "customer_billed_mb", CFG.CUSTOMER)
 
-        summary_df = make_summary(sup_vs_raw, sup_vs_cust, raw_vs_cust)
+        except Exception as e:
+            st.error(f"Reconciliation failed: {e}")
+            st.stop()
 
-        excel_bytes = create_excel({
-            "Summary":               summary_df,
-            "Supplier_vs_Raw":       sup_vs_raw,
-            "Supplier_vs_Customer":  sup_vs_cust,
-            "Raw_vs_Customer":       raw_vs_cust,
-        })
+    report = create_excel({
+        "Supplier_vs_Raw":      cmp_sup_raw,
+        "Supplier_vs_Customer": cmp_sup_bill,
+        "Raw_vs_Customer":      cmp_raw_bill,
+    })
 
-        st.success("Reconciliation complete – download your workbook below.")
-        st.download_button(
-            "⬇️ Download Excel report",
-            data=excel_bytes,
-            file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.download_button(
+        "⬇️  Download reconciliation workbook",
+        data=report,
+        file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-    except Exception as e:
-        st.error(f"Reconciliation failed: {e}")
-
-st.markdown("---")
-st.caption(dt.datetime.now().strftime("Generated %A %B %d, %Y %I:%M %p"))
+# little footer (time only, as requested)
+st.markdown(
+    f"<small>Generated {dt.datetime.now():%A %B %d, %Y %H:%M %p}</small>",
+    unsafe_allow_html=True,
+)
