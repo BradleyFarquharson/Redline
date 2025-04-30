@@ -2,7 +2,7 @@
 """
 Redline — SIM-Bundle Reconciliation
 ==================================
-Upload the three source files (Supplier, Raw usage, Customer billing),
+Upload the three source files (Supplier, Raw usage, Customer Billing),
 hit •Run• and download a single Excel workbook with the three comparison tabs.
 """
 
@@ -31,37 +31,40 @@ class _Cfg:
     BILL_HDR: int = 4           # header row (0-index) in Billing file
     REALM_RX: re.Pattern = re.compile(r"(?<=\s-\s)([A-Za-z]{2}\s?\d+)", re.I)
 
-    SCHEMA: dict[str, dict[str, List[str]]] = field(default_factory=lambda: {
-        "supplier": {
-            "carrier":  ["carrier"],
-            "realm":    ["realm"],
-            "subs_qty": ["subscription_qty", "subscription", "qty"],
-            "data_mb":  ["total_mb", "usage_mb", "total_usage_mb",
-                         "total_usage_(mb)", "total_usage", "data_mb"],
-        },
-        "raw": {
-            "date":     ["date"],
-            "msisdn":   ["msisdn"],
-            "sim":      ["sim_serial", "sim"],
-            "customer": ["customer_code", "customer"],
-            "realm":    ["realm"],
-            "carrier":  ["carrier"],
-            "data_mb":  ["total_usage_(mb)", "total_usage_mb", "usage_mb",
-                         "data_mb", "total_mb"],
-            "status":   ["status"],
-        },
-        "billing": {
-            "customer": ["customer_co", "customer_code", "customer"],
-            "product":  ["product/service", "product_service", "product"],
-            "qty":      ["qty", "quantity"],
-        },
-    })
+    SCHEMA: dict[str, dict[str, List[str]]] = field(
+        default_factory=lambda: {
+            "supplier": {
+                "carrier":  ["carrier"],
+                "realm":    ["realm"],
+                "subs_qty": ["subscription_qty", "subscription", "qty"],
+                "data_mb":  ["total_mb", "usage_mb", "total_usage_mb",
+                             "total_usage_(mb)", "total_usage", "data_mb"],
+            },
+            "raw": {
+                "date":     ["date"],
+                "msisdn":   ["msisdn"],
+                "sim":      ["sim_serial", "sim"],
+                "customer": ["customer_code", "customer"],
+                "realm":    ["realm"],
+                "carrier":  ["carrier"],
+                "data_mb":  ["total_usage_(mb)", "total_usage_mb", "usage_mb",
+                             "data_mb", "total_mb"],
+                "status":   ["status"],
+            },
+            "billing": {
+                "customer": ["customer_co", "customer_code", "customer"],
+                "product":  ["product/service", "product_service", "product"],
+                "qty":      ["qty", "quantity"],
+            },
+        }
+    )
 
 
 CFG = _Cfg()
 
 # ───────────────────────────────  SIMPLE HELPERS
 def _n(s: str) -> str:
+    """snake-case helper"""
     return s.strip().lower().replace(" ", "_")
 
 
@@ -171,8 +174,6 @@ st.markdown("""
 <style>
 .main           {padding-left:0!important; padding-right:0!important;}
 .block-container{max-width:640px!important; margin:0 auto; padding-top:1.5rem;}
-/* hide spinners / warnings while running */
-.css-1v0mbdj,.stAlert,.stSpinner,.stProgress{display:none!important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -184,59 +185,58 @@ f_sup  = c1.file_uploader("Supplier file", type=("csv", "xls", "xlsx"), key="sup
 f_raw  = c2.file_uploader("Raw usage file", type=("csv", "xls", "xlsx"), key="raw")
 f_bill = st.file_uploader("Billing file", type=("csv", "xls", "xlsx"), key="bill")
 
-busy   = st.session_state.get("busy", False)
-clicked = st.button("Run", disabled=busy or not all((f_sup, f_raw, f_bill)))
+busy     = st.session_state.get("busy", False)
+recon_ok = "recon_xlsx" in st.session_state
+
+run_clicked = st.button("Run", disabled=busy or not all((f_sup, f_raw, f_bill)))
 
 # ─── RUN BUTTON HANDLER ──────────────────────────────────────────────────────
-if clicked:
-    try:
-        st.session_state["busy"] = True
+if run_clicked:
+    st.session_state["busy"] = True
+    with st.spinner("Reconciling… this can take a minute"):
+        try:
+            sup  = _load_supplier(f_sup, f_sup.name)
+            raw  = _load_raw(f_raw, f_raw.name)
+            bill = _load_billing(f_bill, f_bill.name)
 
-        sup  = _load_supplier(f_sup, f_sup.name)
-        raw  = _load_raw(f_raw, f_raw.name)
-        bill = _load_billing(f_bill, f_bill.name)
+            # aggregates
+            sup_rlm   = _agg(sup,  ["carrier", "realm"],       "data_mb",    "supplier_mb")
+            sup_tot   = _agg(sup,  ["realm"],                  "data_mb",    "supplier_mb")
+            raw_rlm   = _agg(raw,  ["carrier", "realm"],       "data_mb",    "raw_mb")
+            raw_cust  = _agg(raw,  ["customer", "realm"],      "data_mb",    "raw_mb")
+            bill_rlm  = _agg(bill, ["realm"],                  "billed_mb",  "customer_billed_mb")
+            bill_cust = _agg(bill, ["customer", "realm"],      "billed_mb",  "customer_billed_mb")
 
-        # aggregates
-        sup_rlm   = _agg(sup,  ["carrier", "realm"],       "data_mb",    "supplier_mb")
-        sup_tot   = _agg(sup,  ["realm"],                  "data_mb",    "supplier_mb")
-        raw_rlm   = _agg(raw,  ["carrier", "realm"],       "data_mb",    "raw_mb")
-        raw_cust  = _agg(raw,  ["customer", "realm"],      "data_mb",    "raw_mb")
-        bill_rlm  = _agg(bill, ["realm"],                  "billed_mb",  "customer_billed_mb")
-        bill_cust = _agg(bill, ["customer", "realm"],      "billed_mb",  "customer_billed_mb")
+            # comparisons
+            tab1 = _compare(sup_rlm,  raw_rlm,   ["carrier","realm"],
+                            "supplier_mb", "raw_mb",               CFG.REALM)
+            tab2 = _compare(sup_tot,   bill_rlm,  ["realm"],
+                            "supplier_mb", "customer_billed_mb",   CFG.REALM)
+            tab3 = _compare(raw_cust,  bill_cust,["customer","realm"],
+                            "raw_mb",      "customer_billed_mb",   CFG.CUSTOMER)
 
-        # comparisons
-        tab1 = _compare(sup_rlm,  raw_rlm,   ["carrier","realm"],
-                        "supplier_mb", "raw_mb",               CFG.REALM)
-        tab2 = _compare(sup_tot,   bill_rlm,  ["realm"],
-                        "supplier_mb", "customer_billed_mb",   CFG.REALM)
-        tab3 = _compare(raw_cust,  bill_cust,["customer","realm"],
-                        "raw_mb",      "customer_billed_mb",   CFG.CUSTOMER)
+            # build workbook
+            wb = io.BytesIO()
+            with pd.ExcelWriter(wb, engine="xlsxwriter") as xl:
+                for nm, df in {"Supplier_vs_Raw": tab1,
+                               "Supplier_vs_Cust": tab2,
+                               "Raw_vs_Cust":      tab3}.items():
+                    df.to_excel(xl, sheet_name=nm[:31], index=False)
+            wb.seek(0)
+            st.session_state["recon_xlsx"] = wb.getvalue()
+            st.success("Reconciliation finished ✔")
+        except ValueError as e:
+            st.error(f"File problem: {e}")
+        except Exception as e:
+            st.error(f"Reconciliation failed: {e}")
+    st.session_state["busy"] = False
+    recon_ok = "recon_xlsx" in st.session_state
 
-        # generate Excel workbook in-memory
-        wb = io.BytesIO()
-        with pd.ExcelWriter(wb, engine="xlsxwriter") as xl:
-            for nm, df in {"Supplier_vs_Raw": tab1,
-                           "Supplier_vs_Cust": tab2,
-                           "Raw_vs_Cust":      tab3}.items():
-                df.to_excel(xl, sheet_name=nm[:31], index=False)
-        wb.seek(0)
-
-        # persist bytes for next rerun
-        st.session_state["recon_xlsx"] = wb.getvalue()
-        st.toast("✅ Reconciliation finished – scroll down to download", icon="🎉")
-
-    except ValueError as e:
-        st.error(f"File problem: {e}")
-    except Exception as e:
-        st.error(f"Reconciliation failed: {e}")
-    finally:
-        st.session_state["busy"] = False
-
-# ─── DOWNLOAD BUTTON (always visible once we have bytes) ─────────────────────
-if "recon_xlsx" in st.session_state:
+# ─── DOWNLOAD BUTTON (only when we have bytes) ───────────────────────────────
+if recon_ok:
     st.download_button(
-        "⬇️  Download reconciliation workbook",
+        "⬇️ Download reconciliation workbook",
         st.session_state["recon_xlsx"],
-        file_name = f"Redline_{dt.date.today():%Y%m%d}.xlsx",
-        mime       = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        file_name=f"Redline_{dt.date.today():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
