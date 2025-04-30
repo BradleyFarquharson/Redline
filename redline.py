@@ -81,9 +81,16 @@ _ALIAS = { _n(alias): canon
            for alias in (canon, *aliases) }
 
 
-def _std_cols(df: pd.DataFrame, mapping: dict[str, List[str]],
+def _std_cols(df: pd.DataFrame,
+              mapping: dict[str, list[str]],
               file_name: str) -> pd.DataFrame:
+    # 1-step rename via the global alias-map
     df = df.rename(columns=lambda c: _ALIAS.get(_n(c), _n(c)))
+
+    # 🔧 NEW — keep first occurrence of every column, drop the rest
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+    # sanity-check required columns
     missing = [k for k in mapping if k not in df.columns]
     if missing:
         raise ValueError(f"Required column '{missing[0]}' not found "
