@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt, io, re, traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, List
+from typing import IO
 
 import numpy as np
 import pandas as pd
