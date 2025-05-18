@@ -75,13 +75,6 @@ def _n(s: str) -> str:
     return s.strip().lower().replace(" ", "_")
 
 
-# Build one reverse-alias map so we never loop aliases again
-_ALIAS: dict[str, str] = {
-    _n(alias): canon
-    for cat in CFG.SCHEMA.values()
-    for canon, aliases in cat.items()
-    for alias in (canon, *aliases)
-}
 
 
 RX_NUM = re.compile(r"[^\d.\-]")
@@ -101,7 +94,12 @@ def _std_cols(df: pd.DataFrame,
               mapping: dict[str, list[str]],
               file_name: str) -> pd.DataFrame:
     """Rename columns to canonical names & ensure required ones exist."""
-    df = df.rename(columns=lambda c: _ALIAS.get(_n(c), c))
+    alias_map = {
+        _n(a): canon
+        for canon, aliases in mapping.items()
+        for a in (canon, *aliases)
+    }
+    df = df.rename(columns=lambda c: alias_map.get(_n(c), c))
 
     # drop duplicate columns that may now have identical names
     if df.columns.duplicated().any():
